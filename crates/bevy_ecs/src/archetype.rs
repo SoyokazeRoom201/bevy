@@ -973,7 +973,7 @@ impl Archetypes {
 
                 // First check only fields
                 if let Some(only) = &constraint.only
-                    && !archetype_bits.is_subset(only)
+                    && !archetype_bits.is_subset(&only.0)
                 {
                     ok = false;
                 }
@@ -1038,7 +1038,7 @@ impl Archetypes {
         if let Some(only) = &constraint.only {
             disallowed = archetype_bits
                 .ones()
-                .filter(|&idx| !only.contains(idx))
+                .filter(|&idx| !only.0.contains(idx))
                 .map(ComponentId::new)
                 .collect();
         }

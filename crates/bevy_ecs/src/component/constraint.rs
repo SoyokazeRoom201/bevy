@@ -7,6 +7,8 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{error::Error, fmt};
 use fixedbitset::FixedBitSet;
 
+use crate::component::ComponentInfo;
+
 use super::ComponentId;
 
 /// [`ComponentConstraint`] stored in `ComponentInfo`
@@ -16,7 +18,7 @@ pub struct ComponentConstraint {
     pub dnf: Option<Dnf>,
 
     /// [`ComponentId`] set
-    pub only: Option<FixedBitSet>,
+    pub only: Option<WhiteList>,
 }
 
 impl ComponentConstraint {
@@ -30,7 +32,7 @@ impl ComponentConstraint {
                 for id in &ids {
                     bits.insert(id.index());
                 }
-                bits
+                WhiteList(bits)
             }),
         }
     }
@@ -149,6 +151,10 @@ impl DnfClause {
             && self.forbidden.intersection(archetype_bits).count() == 0
     }
 
+    fn forbidden_contains(&self, require: usize) -> bool {
+        self.forbidden.contains(require)
+    }
+
     /// Merge another clause into this one (AND semantics: union both sets).
     fn merge(&self, other: &DnfClause) -> DnfClause {
         let mut required = self.required.clone();
@@ -198,6 +204,10 @@ impl Dnf {
     /// Returns the clauses of this DNF.
     pub fn clauses(&self) -> &[DnfClause] {
         &self.clauses
+    }
+
+    fn forbidden_contains(&self, forbid: usize) -> bool {
+        self.clauses.iter().all(|c| c.forbidden_contains(forbid))
     }
 }
 
@@ -277,6 +287,94 @@ fn negate_clause(clause: &DnfClause) -> Vec<DnfClause> {
         result.push(c);
     }
     result
+}
+
+/// Same as `and_dnf`
+fn dnf_is_disjoint(left: &Dnf, right: &Dnf) -> bool {
+    for l in left.clauses() {
+        for r in right.clauses() {
+            let merged = l.merge(r);
+            if merged.is_satisfiable() {
+                return false;
+            }
+        }
+    }
+
+    true 
+}
+
+fn component_dnf_is_disjoint(
+    left_id: ComponentId,
+    right_id: ComponentId,
+    left: Option<&Dnf>,
+    right: Option<&Dnf>,
+) -> bool {
+    match (left, right) {
+        (None, None) => false,
+        (None, Some(right)) => {
+            right.forbidden_contains(left_id.0)
+        },
+        (Some(left), None) => {
+            left.forbidden_contains(right_id.0)
+        },
+        (Some(left), Some(right)) => {
+            left.forbidden_contains(right_id.0)
+            || right.forbidden_contains(left_id.0)
+            || dnf_is_disjoint(left, right)
+        },
+    }
+}
+
+
+/// For indicating this component can only contain other components.
+#[derive(Debug, Clone)]
+pub struct WhiteList(pub(crate) FixedBitSet);
+
+fn component_id_whitelist_is_disjoint(
+    left_id: ComponentId,
+    right_id: ComponentId,
+    left: Option<&WhiteList>,
+    right: Option<&WhiteList>,
+) -> bool {
+    match (left, right) {
+        (None, None) => false,
+        (None, Some(right)) => !right.0.contains(left_id.index()),
+        (Some(left), None) => !left.0.contains(right_id.index()),
+        (Some(left), Some(right)) => {
+            !left.0.contains(right_id.index()) || !right.0.contains(left_id.index())
+        },
+    }
+}
+
+pub(crate) fn component_constraints_is_disjoint(left: &ComponentInfo, right: &ComponentInfo) -> bool {
+    let left_id = left.id;
+    let right_id = right.id;
+
+    match (left.constraint(), right.constraint()) {
+        (None, None) => false,
+        (None, Some(right)) => {
+            if component_id_whitelist_is_disjoint(left_id, right_id, None, right.only.as_ref()) {
+                return true;
+            }
+
+
+            component_dnf_is_disjoint(left_id, right_id, None, right.dnf.as_ref()) 
+        },
+        (Some(left), None) => {
+            if component_id_whitelist_is_disjoint(left_id, right_id, left.only.as_ref(), None) {
+                return true;
+            }
+
+            component_dnf_is_disjoint(left_id, right_id, left.dnf.as_ref(), None) 
+        },
+        (Some(left), Some(right)) => {
+            if component_id_whitelist_is_disjoint(left_id, right_id, left.only.as_ref(), right.only.as_ref()) {
+                return true;
+            }
+
+            component_dnf_is_disjoint(left_id, right_id, left.dnf.as_ref(), right.dnf.as_ref()) 
+        },
+    }
 }
 
 #[cfg(test)]
@@ -518,5 +616,153 @@ mod tests {
         assert!(!world.entity(a).contains::<Health>(), "a should not have Health");
         assert!(world.entity(b).contains::<Health>(), "b should have Health");
         assert!(!world.entity(c).contains::<Health>(), "c also should have Health");
+    }
+
+    use crate::query::{QueryState, With};
+
+    #[derive(Component, Default)]
+    #[constraint(forbid(Villain))]
+    struct Hero;
+
+    #[derive(Component, Default)]
+    #[constraint(forbid(Hero))]
+    struct Villain;
+
+    #[derive(Component, Default)]
+    struct Transform;
+
+    #[test]
+    fn exclusion_matrix_built_on_registration() {
+        let mut world = World::new();
+        world.register_component::<Hero>();
+        world.register_component::<Villain>();
+
+        let hero_id = world.components().component_id::<Hero>().unwrap();
+        let villain_id = world.components().component_id::<Villain>().unwrap();
+
+        let hero_exclusions = world.components().get_exclusions(hero_id);
+        assert!(hero_exclusions.is_some(), "Hero should have exclusions");
+        assert!(
+            hero_exclusions.unwrap().contains(villain_id),
+            "Hero's exclusion list should contain Villain"
+        );
+
+        let villain_exclusions = world.components().get_exclusions(villain_id);
+        assert!(villain_exclusions.is_some(), "Villain should have exclusions");
+        assert!(
+            villain_exclusions.unwrap().contains(hero_id),
+            "Villain's exclusion list should contain Hero"
+        );
+    }
+
+    #[test]
+    fn exclusion_reduces_false_positive_ambiguity() {
+        let mut world = World::new();
+
+        let query_a = QueryState::<&mut Transform, With<Hero>>::new(&mut world);
+        let query_b = QueryState::<&mut Transform, With<Villain>>::new(&mut world);
+
+        assert!(
+            query_a.component_access().is_compatible(query_b.component_access()),
+            "Query<&mut Transform, With<Hero>> and Query<&mut Transform, With<Villain>> \
+             should be compatible because Hero and Villain are mutually exclusive"
+        );
+    }
+
+    // Non-exclusive components must NOT be reported as compatible
+    #[derive(Component, Default)]
+    struct Friendly;
+
+    #[derive(Component, Default)]
+    struct Neutral;
+
+    #[derive(Component, Default)]
+    #[constraint(require(Friendly))]
+    struct Companion;
+
+    #[test]
+    fn non_exclusive_remains_incompatible() {
+        let mut world = World::new();
+        let query_a = QueryState::<&mut Transform, With<Friendly>>::new(&mut world);
+        let query_b = QueryState::<&mut Transform, With<Neutral>>::new(&mut world);
+
+        assert!(
+            !query_a.component_access().is_compatible(query_b.component_access()),
+            "Query<&mut Transform, With<Friendly>> and Query<&mut Transform, With<Neutral>> \
+             must NOT be compatible"
+        );
+    }
+
+    #[test]
+    fn require_does_not_imply_exclusion() {
+        let mut world = World::new();
+
+        // Companion requires Friendly, but does not forbid anything.
+        let query_a = QueryState::<&mut Transform, With<Companion>>::new(&mut world);
+        let query_b = QueryState::<&mut Transform, With<Friendly>>::new(&mut world);
+
+        assert!(
+            !query_a.component_access().is_compatible(query_b.component_access()),
+            "Query<&mut Transform, With<Companion>> and Query<&mut Transform, With<Friendly>> \
+             must NOT be compatible"
+        );
+    }
+
+    #[test]
+    fn no_constraint_no_exclusion() {
+        let mut world = World::new();
+
+        let a_id = world.register_component::<Friendly>();
+        let b_id = world.register_component::<Neutral>();
+
+        assert!(
+            world.components().get_exclusions(a_id).is_none()
+            || !world.components().get_exclusions(a_id).unwrap().contains(b_id),
+            "Friendly should not exclude Neutral"
+        );
+        assert!(
+            world.components().get_exclusions(b_id).is_none()
+            || !world.components().get_exclusions(b_id).unwrap().contains(a_id),
+            "Neutral should not exclude Friendly"
+        );
+    }
+
+    #[derive(Component, Default)]
+    struct PoisonX;
+
+    #[derive(Component, Default)]
+    struct PoisonY;
+
+    #[derive(Component, Default)]
+    #[constraint(or(forbid(PoisonX), forbid(PoisonY)))]
+    struct Immune;
+
+    #[test]
+    fn or_forbid_allows_single() {
+        let mut world = World::new();
+        let e = world.spawn((Immune, PoisonX)).id();
+        assert!(world.entity(e).contains::<Immune>());
+
+        let e2 = world.spawn((Immune, PoisonY)).id();
+        assert!(world.entity(e2).contains::<Immune>());
+    }
+
+    #[test]
+    fn or_forbid_rejects_both() {
+        let mut world = World::new();
+        let e = world.spawn((Immune, PoisonX, PoisonY)).id();
+        assert!(!world.entity(e).contains::<Immune>());
+    }
+
+    #[test]
+    fn or_forbid_does_not_create_exclusion() {
+        let mut world = World::new();
+        let query_a = QueryState::<&mut Transform, With<Immune>>::new(&mut world);
+        let query_b = QueryState::<&mut Transform, With<PoisonX>>::new(&mut world);
+
+        assert!(
+            !query_a.component_access().is_compatible(query_b.component_access()),
+            "Immune and PoisonX can coexist"
+        );
     }
 }

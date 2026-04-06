@@ -16,10 +16,10 @@ use crate::{
     archetype::ArchetypeFlags,
     component::{
         Component, ComponentCloneBehavior, ComponentConstraint, ComponentMutability,
-        QueuedComponents, RequiredComponents, StorageType,
+        QueuedComponents, RequiredComponents, StorageType, component_constraints_is_disjoint,
     },
     lifecycle::ComponentHooks,
-    query::DebugCheckedUnwrap as _,
+    query::{ComponentIdSet, DebugCheckedUnwrap as _},
     relationship::{
         MaybeRelationshipAccessor, RelationshipAccessor, RelationshipAccessorInitializer,
     },
@@ -370,7 +370,7 @@ pub struct Components {
     pub(super) queued: bevy_platform::sync::RwLock<QueuedComponents>,
     // ComponentId <-> Exclusion BitSet with all other components
     // solve SAT problem for all components pair in registration phase
-    // exclusions: Vec<Option<FixBitSet>>,
+    pub(super) exclusions: Vec<Option<ComponentIdSet>>,
 }
 
 impl Components {
@@ -764,5 +764,57 @@ impl Components {
                 info.as_mut()
                     .map(|info| &mut info.descriptor.relationship_accessor)
             })
+    }
+
+    pub(crate) fn update_exclusions(&mut self, component_id: ComponentId) {
+        self.exclusions.resize(self.len(), None);
+
+        if let Some(info) = 
+            self.components
+                .get(component_id.0)
+                .and_then(|info| info.as_ref())
+        {
+            for others in &self.components {
+                let Some(other_info) = others else { continue; };
+
+                // jump over myself
+                if other_info.id == component_id { continue; }
+
+                if component_constraints_is_disjoint(info, other_info) {
+                    // exclusions already ensured by resize
+                    {
+                        let entry = &mut self.exclusions[info.id.0];
+                        if let Some(bits) = entry {
+                            bits.insert(other_info.id);
+                        } else {
+                            let mut new_set = ComponentIdSet::new();
+                            new_set.insert(other_info.id);
+                            *entry = Some(new_set);
+                        }
+                    }
+
+                    {
+                        let entry = &mut self.exclusions[other_info.id.0];
+                        if let Some(bits) = entry {
+                            bits.insert(info.id);
+                        } else {
+                            let mut new_set = ComponentIdSet::new();
+                            new_set.insert(info.id);
+                            *entry = Some(new_set);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get a exclusion list for one [`Component`], if any.
+    pub(crate) fn get_exclusions(&self, component_id: ComponentId) -> Option<&ComponentIdSet> {
+        self.exclusions.get(component_id.index())?.as_ref()
+    }
+
+    /// Get a constraint for this component, if any.
+    pub fn get_constraint(&self, component_id: ComponentId) -> Option<&ComponentConstraint> {
+        self.get_info(component_id)?.constraint()
     }
 }

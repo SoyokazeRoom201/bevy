@@ -6,13 +6,11 @@ use crate::{
     entity_disabling::DefaultQueryFilters,
     prelude::FromWorld,
     query::{
-        ArchetypeFilter, ContiguousQueryData, FilteredAccess, FilteredAccessSet, IterQueryData,
-        QueryCombinationIter, QueryContiguousIter, QueryIter, QueryParIter, SingleEntityQueryData,
-        WorldQuery,
+        ArchetypeFilter, ComponentIdSet, ContiguousQueryData, FilteredAccess, FilteredAccessSet, IterQueryData, QueryCombinationIter, QueryContiguousIter, QueryIter, QueryParIter, SingleEntityQueryData, WorldQuery
     },
     storage::TableId,
     system::Query,
-    world::{unsafe_world_cell::UnsafeWorldCell, World, WorldId},
+    world::{World, WorldId, unsafe_world_cell::UnsafeWorldCell},
 };
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "multi_threaded"))]
@@ -267,10 +265,21 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         // main Query's `fetch_state` access. Filters are allowed to conflict with the main query fetch
         // because they are evaluated *before* a specific reference is constructed.
         let mut filter_component_access = FilteredAccess::default();
+        
         F::update_component_access(&filter_state, &mut filter_component_access);
 
-        // TODO: A good place, extend `filter_component_access.filter_sets.without` base on exclusions in Components
-        // i.e. extend the [`Without<A>`] to [`(Without<A>, Without<B>)`]
+        // Inject exclusions from constraint system into filter_sets.
+        for filter_set in &mut filter_component_access.filter_sets {
+            let mut extra = ComponentIdSet::new();
+
+            for with_id in filter_set.with.iter() {
+                if let Some(exclusions) = world.components().get_exclusions(with_id) {
+                    extra.union_with(exclusions);
+                }
+            }
+
+            filter_set.without.union_with(&extra);
+        }
 
         // Merge the temporary filter access with the main access. This ensures that filter access is
         // properly considered in a global "cross-query" context (both within systems and across systems).

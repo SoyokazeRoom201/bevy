@@ -1079,6 +1079,11 @@ impl AccessFilters {
         &self.without
     }
 
+    /// Extend the without set
+    pub fn extend_without(&mut self, without_set: &ComponentIdSet) {
+        self.without.extend(without_set);
+    }
+
     fn is_ruled_out_by(&self, other: &Self) -> bool {
         // Although not technically complete, we don't consider the case when `AccessFilters`'s
         // `without` bitset contradicts its own `with` bitset (e.g. `(With<A>, Without<A>)`).

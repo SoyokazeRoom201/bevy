@@ -278,9 +278,12 @@ impl<'w> ComponentsRegistrator<'w> {
         if let Some(constraint) = &mut info.constraint
             && let Some(only) = &mut constraint.only
         {
-            only.grow(id.index() + 1);
-            only.insert(id.index());
+            only.0.grow(id.index() + 1);
+            only.0.insert(id.index());
         }
+
+        // Update exclusion for constraints
+        self.components.update_exclusions(id);
     }
 
     /// Registers a component described by `descriptor`.
